@@ -101,24 +101,24 @@ if (request.getSession() != null)
 		<p style="display: none;" id="loadingSign"><%= bundle.getString("challenge.form.loading") %></p>
 		<br />
 		<div id="forgottenPassDiv" style="display: none;">
-			<h2 class='title'><%= bundle.getString("reset.header") %></h2>
-			<p><%= bundle.getString("reset.whatToDo") %></p>
 			<form id="leForm2" action="javascript:;">
-				<label for="resetEmail"><%= bundle.getString("reset.email") %></label>
-				<input id="resetEmail" type="email" autocomplete="email" required />
-				<input id="resetSubmit" type="submit" value="<%= bundle.getString("reset.requestCode") %>" />
+				<h2 class='title'><%= bundle.getString("reset.header") %></h2>
+				<p><%= bundle.getString("reset.whatToDo") %></p>
+				<table>
+					<tr>
+						</td>
+						<div id="resetSubmit">
+							<input id="resetEmail" type="text" autocomplete="off" /><input
+								type="submit" value="<%= bundle.getString("reset.header") %>" />
+						</div>
+						<p style="display: none;" id="resetLoadingSign"><%= bundle.getString("challenge.form.loading") %></p>
+						</td>
+					</tr>
+				</table>
 			</form>
-			<form id="leForm3" action="javascript:;" style="display: none;">
-				<p><%= bundle.getString("reset.enterCode") %></p>
-				<label for="resetCode"><%= bundle.getString("reset.code") %></label>
-				<input id="resetCode" type="text" autocomplete="one-time-code" required />
-				<label for="newPassword"><%= bundle.getString("reset.newPassword") %></label>
-				<input id="newPassword" type="password" autocomplete="new-password" minlength="8" required />
-				<input id="confirmResetSubmit" type="submit" value="<%= bundle.getString("reset.confirm") %>" />
-			</form>
-			<p style="display: none;" id="resetLoadingSign"><%= bundle.getString("challenge.form.loading") %></p>
-			<div id="resultsDiv2" role="status" aria-live="polite"></div>
+			<div id="resultsDiv2"></div>
 		</div>
+
 
 		</p>
 	</div>
@@ -153,61 +153,35 @@ if (request.getSession() != null)
 				});
 			});
 			
-			var requestedEmail = "";
-			var resetEndpoint = "f5ddc0ed2d30e597ebacf5fdd117083674b19bb92ffc3499121b9e6a12c92959";
-
-			$("#leForm2").submit(function(event){
-				event.preventDefault();
-				var email = $("#resetEmail").val();
-				requestedEmail = "";
-				$("#leForm3").hide();
-				$("#resetCode").val("");
-				$("#newPassword").val("");
-				$("#resetSubmit").prop("disabled", true);
-				$("#resetLoadingSign").show();
-				$("#resultsDiv2").empty();
-				$.ajax({
-					type: "POST",
-					url: resetEndpoint,
-					data: { subEmail: email }
-				}).done(function(){
-					requestedEmail = email;
-					$("#resultsDiv2").text("<%= bundle.getString("reset.requestSent") %>");
-					$("#leForm3").show();
-				}).fail(function(){
-					$("#resultsDiv2").text("<%= bundle.getString("error.occurred") %>");
-				}).always(function(){
-					$("#resetLoadingSign").hide();
-					$("#resetSubmit").prop("disabled", false);
-				});
-			});
-
-			$("#leForm3").submit(function(event){
-				event.preventDefault();
-				$("#confirmResetSubmit").prop("disabled", true);
-				$("#resetLoadingSign").show();
-				$("#resultsDiv2").empty();
-				$.ajax({
-					type: "POST",
-					url: resetEndpoint,
-					data: {
-						subEmail: requestedEmail,
-						resetCode: $("#resetCode").val(),
-						newPassword: $("#newPassword").val()
+			$("#leForm2").submit(function(){
+				var theResetEmail = $("#resetEmail").val();
+				$("#resetSubmit").hide("fast");
+				$("#resetLoadingSign").show("slow");
+				$("#resultsDiv2").hide("slow", function(){
+					var ajaxCall = $.ajax({
+						type: "POST",
+						url: "f5ddc0ed2d30e597ebacf5fdd117083674b19bb92ffc3499121b9e6a12c92959",
+						data: {
+							subEmail: theResetEmail
+						},
+						async: false
+					});
+					if(ajaxCall.status == 200)
+					{
+						$("#resultsDiv2").html("<p><%= bundle.getString("reset.requestSent") %></p>");
 					}
-				}).done(function(){
-					$("#resultsDiv2").text("<%= bundle.getString("reset.changed") %>");
-					$("#leForm3").hide();
-					$("#resetCode").val("");
-					$("#newPassword").val("");
-				}).fail(function(){
-					$("#resultsDiv2").text("<%= bundle.getString("reset.failed") %>");
-				}).always(function(){
-					$("#resetLoadingSign").hide();
-					$("#confirmResetSubmit").prop("disabled", false);
+					else
+					{
+						$("#resultsDiv2").html("<p> <%= bundle.getString("error.occurred") %>: " + ajaxCall.status + " " + ajaxCall.statusText + "</p>");
+					}
+					$("#resultsDiv2").show("slow", function(){
+						$("#resetLoadingSign").hide("fast", function(){
+							$("#resetSubmit").show("slow");
+						});
+					});
 				});
 			});
-
+			
 			$("#forgottenPasswordLink").click(function(){
 				$("#forgottenPassDiv").toggle("slow", function(){
 					//Animation Complete

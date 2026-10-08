@@ -2,29 +2,12 @@ package servlets.module.challenge;
 
 import dbProcs.Database;
 import java.io.IOException;
-import java.io.Serializable;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Base64;
 import java.util.Locale;
-import java.util.Properties;
 import java.util.ResourceBundle;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import javax.mail.Authenticator;
-import javax.mail.Message;
-import javax.mail.MessagingException;
-import javax.mail.PasswordAuthentication;
-import javax.mail.Transport;
-import javax.mail.internet.AddressException;
-import javax.mail.internet.InternetAddress;
-import javax.mail.internet.MimeMessage;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
@@ -32,12 +15,26 @@ import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.HttpSession;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.owasp.encoder.Encode;
+import utils.Hash;
 import utils.ShepherdLogManager;
 import utils.Validate;
 
 /**
- * Session Management Challenge Two - Password recovery servlet. This file is part of the Security
- * Shepherd Project and is distributed under the GNU General Public License, version 3 or later.
+ * Session Management Challenge Two - Password Reset Servlet Does not return result key <br>
+ * <br>
+ * This file is part of the Security Shepherd Project.
+ *
+ * <p>The Security Shepherd project is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free Software Foundation, either
+ * version 3 of the License, or (at your option) any later version.<br>
+ *
+ * <p>The Security Shepherd project is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE. See the GNU General Public License for more details.<br>
+ *
+ * <p>You should have received a copy of the GNU General Public License along with the Security
+ * Shepherd project. If not, see <http://www.gnu.org/licenses/>.
  *
  * @author Mark Denihan
  */
@@ -46,12 +43,7 @@ public class SessionManagement2ChangePassword extends HttpServlet {
   private static final long serialVersionUID = 1L;
   private static final Logger log = LogManager.getLogger(SessionManagement2ChangePassword.class);
   private static final String CHALLENGE_SCHEMA = "BrokenAuthAndSessMangChalTwo";
-  private static final String PENDING_RESET = "sessionManagement2PendingReset";
-  private static final long RESET_TTL_MILLIS = 10 * 60 * 1000L;
-  private static final long SEND_COOLDOWN_MILLIS = 60 * 1000L;
-  private static final SecureRandom RANDOM = new SecureRandom();
-  private final ConcurrentHashMap<String, Long> lastSentAtByEmail = new ConcurrentHashMap<>();
-
+  private static final String BLOCKED_ACCOUNT = "admin";
   public static String levelHash =
       "f5ddc0ed2d30e597ebacf5fdd117083674b19bb92ffc3499121b9e6a12c92959";
 
@@ -60,11 +52,6 @@ public class SessionManagement2ChangePassword extends HttpServlet {
       throws ServletException, IOException {
     ShepherdLogManager.setRequestIp(request.getRemoteAddr(), request.getHeader("X-Forwarded-For"));
     HttpSession session = request.getSession(false);
-    Locale locale = new Locale(Validate.validateLanguage(session));
-    ResourceBundle bundle =
-        ResourceBundle.getBundle(
-            "i18n.servlets.challenges.sessionManagement.sessionManagement2", locale);
-
     if (!Validate.validateSession(session)) {
       response.sendError(HttpServletResponse.SC_UNAUTHORIZED);
       return;
@@ -76,245 +63,84 @@ public class SessionManagement2ChangePassword extends HttpServlet {
         session.getAttribute("userName").toString());
 
     String email = request.getParameter("subEmail");
-    if (!validEmail(email)) {
+    if (email == null || email.length() > 128 || !email.matches("[^\\s@]+@[^\\s@]+\\.[^\\s@]+")) {
       response.sendError(HttpServletResponse.SC_BAD_REQUEST);
       return;
     }
 
-    String code = request.getParameter("resetCode");
-    String newPassword = request.getParameter("newPassword");
-    boolean requestingCode = code == null && newPassword == null;
-    if (requestingCode && !smtpConfigured()) {
-      response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
-      return;
-    }
+    Locale locale = new Locale(Validate.validateLanguage(session));
+    ResourceBundle bundle =
+        ResourceBundle.getBundle(
+            "i18n.servlets.challenges.sessionManagement.sessionManagement2", locale);
+    String changedTo = bundle.getString("response.changedTo");
+    String newPassword = Hash.randomString();
 
     try (Connection connection = openChallengeConnection()) {
-      if (requestingCode) {
-        // Give the same response whether or not the address belongs to an account.
-        try {
-          requestReset(connection, session, email);
-        } catch (MessagingException e) {
-          log.error("Challenge 2 reset message could not be delivered", e);
-        }
-        response.getWriter().write(bundle.getString("response.requestAccepted"));
-      } else if (confirmReset(connection, session, email, code, newPassword)) {
-        response.getWriter().write(bundle.getString("response.passwordChanged"));
+      if (resetPassword(connection, email, newPassword)) {
+        response.getWriter().write(changedTo + " " + Encode.forHtml(newPassword));
       } else {
-        response.sendError(HttpServletResponse.SC_BAD_REQUEST);
+        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        response.getWriter().write("Password unchanged. " + changedTo + " Unchanged");
       }
-    } catch (Exception e) {
+    } catch (SQLException e) {
       log.error("Challenge 2 password reset failed", e);
       response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
     }
   }
 
-  /** Issues a code only to the stored address. Asking for a code never changes a password. */
-  boolean requestReset(Connection connection, HttpSession session, String email) throws Exception {
-    if (!validEmail(email)) {
-      return false;
-    }
-
-    int userId;
-    try (PreparedStatement statement =
-        connection.prepareStatement("SELECT userId FROM users WHERE userAddress = ?")) {
-      statement.setString(1, email);
-      try (ResultSet result = statement.executeQuery()) {
-        if (!result.next()) {
-          return false;
-        }
-        userId = result.getInt(1);
-        // A shared address cannot identify one account safely.
-        if (result.next()) {
-          return false;
-        }
-      }
-    }
-
-    long now = nowMillis();
-    AtomicBoolean permitted = new AtomicBoolean();
-    lastSentAtByEmail.compute(
-        email,
-        (address, previous) -> {
-          if (previous != null && now - previous < SEND_COOLDOWN_MILLIS) {
-            return previous;
-          }
-          permitted.set(true);
-          return now;
-        });
-    if (!permitted.get()) {
-      return false;
-    }
-
-    byte[] codeBytes = new byte[16];
-    RANDOM.nextBytes(codeBytes);
-    String code = Base64.getUrlEncoder().withoutPadding().encodeToString(codeBytes);
-    try {
-      sendResetCode(email, code);
-    } catch (Exception e) {
-      lastSentAtByEmail.remove(email, now);
-      throw e;
-    }
-    session.setAttribute(
-        PENDING_RESET, new PendingReset(userId, email, digest(code), now + RESET_TTL_MILLIS));
-    return true;
-  }
-
-  /** Accepts a code once, for its original account, before changing that account's password. */
-  boolean confirmReset(
-      Connection connection, HttpSession session, String email, String code, String newPassword)
+  /** Preserves the legacy reset for non-admin accounts, but never updates the admin account. */
+  boolean resetPassword(Connection connection, String email, String newPassword)
       throws SQLException {
-    if (!validEmail(email)
-        || code == null
-        || code.length() > 64
-        || newPassword == null
-        || !Validate.isValidPassword(newPassword)) {
-      return false;
-    }
-
-    PendingReset pending;
-    synchronized (session) {
-      Object stored = session.getAttribute(PENDING_RESET);
-      if (!(stored instanceof PendingReset)) {
-        return false;
+    boolean originalAutoCommit = connection.getAutoCommit();
+    connection.setAutoCommit(false);
+    try {
+      int userId;
+      try (PreparedStatement lookup =
+          connection.prepareStatement(
+              "SELECT userId, userName FROM users WHERE userAddress = ? FOR UPDATE")) {
+        lookup.setString(1, email);
+        try (ResultSet users = lookup.executeQuery()) {
+          if (!users.next()) {
+            connection.rollback();
+            return false;
+          }
+          userId = users.getInt("userId");
+          String userName = users.getString("userName");
+          if (userName == null
+              || BLOCKED_ACCOUNT.equalsIgnoreCase(userName.trim())
+              || users.next()) {
+            connection.rollback();
+            return false;
+          }
+        }
       }
-      pending = (PendingReset) stored;
-      if (nowMillis() > pending.expiresAt) {
-        session.removeAttribute(PENDING_RESET);
-        return false;
-      }
-      if (!pending.email.equals(email) || !MessageDigest.isEqual(pending.codeHash, digest(code))) {
-        return false;
-      }
-      session.removeAttribute(PENDING_RESET);
-    }
 
-    try (PreparedStatement statement =
-        connection.prepareStatement(
-            "UPDATE users SET userPassword = SHA(?) WHERE userId = ? AND userAddress = ?")) {
-      statement.setString(1, newPassword);
-      statement.setInt(2, pending.userId);
-      statement.setString(3, pending.email);
-      return statement.executeUpdate() == 1;
+      try (PreparedStatement update =
+          connection.prepareStatement(
+              "UPDATE users SET userPassword = SHA(?) WHERE userId = ? AND userAddress = ?")) {
+        update.setString(1, newPassword);
+        update.setInt(2, userId);
+        update.setString(3, email);
+        if (update.executeUpdate() != 1) {
+          connection.rollback();
+          return false;
+        }
+      }
+      connection.commit();
+      return true;
+    } catch (SQLException e) {
+      try {
+        connection.rollback();
+      } catch (SQLException rollbackError) {
+        e.addSuppressed(rollbackError);
+      }
+      throw e;
+    } finally {
+      connection.setAutoCommit(originalAutoCommit);
     }
-  }
-
-  protected long nowMillis() {
-    return System.currentTimeMillis();
   }
 
   protected Connection openChallengeConnection() throws SQLException {
     return Database.getChallengeConnection(getServletContext().getRealPath(""), CHALLENGE_SCHEMA);
-  }
-
-  /**
-   * SMTP is configured with SECURITY_SHEPHERD_CHAL2_SMTP_HOST, _PORT, _FROM, _USER and _PASSWORD.
-   * STARTTLS is mandatory. Tests replace this method with an in-memory sender.
-   */
-  protected void sendResetCode(String email, String code) throws MessagingException {
-    if (!smtpConfigured()) {
-      throw new MessagingException("Challenge 2 SMTP is not configured");
-    }
-
-    String host = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_HOST");
-    String port = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_PORT");
-    String from = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_FROM");
-    String user = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_USER");
-    String password = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_PASSWORD");
-
-    Properties properties = new Properties();
-    properties.setProperty("mail.smtp.host", host);
-    properties.setProperty("mail.smtp.port", port);
-    properties.setProperty("mail.smtp.auth", "true");
-    properties.setProperty("mail.smtp.starttls.enable", "true");
-    properties.setProperty("mail.smtp.starttls.required", "true");
-    properties.setProperty("mail.smtp.ssl.checkserveridentity", "true");
-    properties.setProperty("mail.smtp.connectiontimeout", "5000");
-    properties.setProperty("mail.smtp.timeout", "5000");
-    properties.setProperty("mail.smtp.writetimeout", "5000");
-
-    javax.mail.Session mailSession =
-        javax.mail.Session.getInstance(
-            properties,
-            new Authenticator() {
-              @Override
-              protected PasswordAuthentication getPasswordAuthentication() {
-                return new PasswordAuthentication(user, password);
-              }
-            });
-    MimeMessage message = new MimeMessage(mailSession);
-    message.setFrom(new InternetAddress(from));
-    message.setRecipient(Message.RecipientType.TO, new InternetAddress(email));
-    message.setSubject("Security Shepherd Challenge 2 reset code", StandardCharsets.UTF_8.name());
-    message.setText(
-        "Enter this code in the same browser to reset your Challenge 2 password: "
-            + code
-            + "\nThe code expires in 10 minutes.\n",
-        StandardCharsets.UTF_8.name());
-    Transport.send(message);
-  }
-
-  protected boolean smtpConfigured() {
-    String host = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_HOST");
-    String port = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_PORT");
-    String from = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_FROM");
-    String user = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_USER");
-    String password = System.getenv("SECURITY_SHEPHERD_CHAL2_SMTP_PASSWORD");
-    if (host == null
-        || host.isEmpty()
-        || port == null
-        || !validEmail(from)
-        || user == null
-        || user.isEmpty()
-        || password == null
-        || password.isEmpty()) {
-      return false;
-    }
-    try {
-      int parsedPort = Integer.parseInt(port);
-      return parsedPort > 0 && parsedPort <= 65535;
-    } catch (NumberFormatException e) {
-      return false;
-    }
-  }
-
-  private static boolean validEmail(String email) {
-    if (email == null
-        || email.isEmpty()
-        || email.length() > 128
-        || email.contains("\r")
-        || email.contains("\n")) {
-      return false;
-    }
-    try {
-      InternetAddress address = new InternetAddress(email, true);
-      address.validate();
-      return email.equals(address.getAddress());
-    } catch (AddressException e) {
-      return false;
-    }
-  }
-
-  private static byte[] digest(String code) {
-    try {
-      return MessageDigest.getInstance("SHA-256").digest(code.getBytes(StandardCharsets.UTF_8));
-    } catch (NoSuchAlgorithmException e) {
-      throw new IllegalStateException("SHA-256 unavailable", e);
-    }
-  }
-
-  private static final class PendingReset implements Serializable {
-    private static final long serialVersionUID = 1L;
-    private final int userId;
-    private final String email;
-    private final byte[] codeHash;
-    private final long expiresAt;
-
-    private PendingReset(int userId, String email, byte[] codeHash, long expiresAt) {
-      this.userId = userId;
-      this.email = email;
-      this.codeHash = codeHash;
-      this.expiresAt = expiresAt;
-    }
   }
 }
